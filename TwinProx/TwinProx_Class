@@ -1,0 +1,265 @@
+import minimalmodbus
+import time
+from datetime import datetime
+import numpy as np
+import struct
+from tqdm import tqdm
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+from typing import List, Dict, Tuple
+import math
+
+class TwinProx:
+    def __init__(self, port: str, slaveaddress: int):
+        self.slave = minimalmodbus.Instrument(port=port, slaveaddress=slaveaddress)
+        self.configure_modbus_settings()
+        self.data_array = []
+        self.header = []
+        self.groove_array = []
+        self.waveforms = []
+        self.channel_a = []
+        self.channel_b = []
+
+    def configure_modbus_settings(self):
+        self.slave.serial.baudrate = 115200
+        self.slave.serial.bytesize = 8
+        self.slave.serial.parity = "N"
+        self.slave.serial.stopbits = 1
+        self.slave.serial.timeout = 0.10
+        self.slave.close_port_after_each_call = True
+        self.slave.mode = minimalmodbus.MODE_RTU
+        self.slave.clear_buffers_before_each_transaction = True
+
+    def setup_capture(self, modbus_channel_ab: int = 6) -> int:
+        self.slave.write_register(32, modbus_channel_ab)
+        return self.slave.read_register(32)
+
+    def trigger_capture(self) -> int:
+        self.data_array, self.header, self.groove_array = [], [], [] 
+        self.slave.write_register(33, 1)
+        return int(str(time.time())[slice(10)])
+
+    def check_capture_engine(self) -> int:
+        return self.slave.read_register(34, functioncode=3)
+
+    def get_dataclip_size(self) -> int:
+        return self.slave.read_long(36, functioncode=3)
+    
+    def extract_header(self) -> List[int]:
+        self.header = self.data_array[:8]
+        del self.data_array[:8]
+        return self.header
+    
+    def extract_waves(self) -> List[int]:
+        self.waveforms = self.data_array[:3600]
+        del self.data_array[:3600]
+        return self.waveforms
+    
+    def extract_grooves(self) -> List[int]:
+        self.groove_array = self.data_array[:8]
+        del self.data_array[:8]
+        return self.groove_array
+    
+    def scale_waveforms(self) -> List[int]: 
+        self.waveforms = [value / 100.0 for value in self.waveforms]
+        return self.waveforms
+    
+    def split_channels(self) -> List[int]: 
+        self.channel_a, self.channel_b = self.waveforms[:8], self.waveforms[:8],
+        del self.data_array[:8]
+        return self.waveforms
+    
+    def extract_data(self) -> List[int]:
+        self.data_array = []
+        total_chunks = math.ceil(self.get_dataclip_size() / 122)
+
+        for _ in tqdm(range(total_chunks), desc="Extracting Data", ncols=100):
+            chunk = self.slave.read_registers(49, 123, functioncode=3)
+            index = chunk.pop(0)
+            print(f"index {index}")
+            if index == 0:
+                self.update_header()
+            else:
+                pass
+            self.data_array.extend(chunk)
+        print(f"Data {self.data_array}, Header {self.header}, Waveforms {self.waveforms}, Groove {self.groove_array}")
+        print(f"Extracting Header")
+        self.extract_header()
+        
+        print(f"Data {self.data_array}, Header {self.header}, Waveforms {self.waveforms}, Groove {self.groove_array}")
+        print(f"Extracting Waves")
+        self.extract_waves()
+        
+        print(f"Data {self.data_array}, Header {self.header}, Waveforms {self.waveforms}, Groove {self.groove_array}")
+        print(f"Extracting Grooves")
+        self.extract_grooves()
+        
+        print(f"Scaling Waveforms")
+        self.scale_waveforms()
+        print(f"Data {self.data_array}, Header {self.header}, Waveforms {self.waveforms}, Groove {self.groove_array}")
+        
+        return self.data_array
+
+# def extract_waveforms(data_array: List[int]) -> List[int]:
+#     waveforms = data_array[:3600]
+#     del data_array[:3600]
+#     return waveforms
+
+# def extract_groove_array(data_array: List[int]) -> List[int]:
+#     return data_array
+
+def calculate_crc(data: List[int]) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc >>= 1
+                crc ^= 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+def replace_with_nan(channel, indexes):
+    waveforms = np.array(channel)
+    groove_array = indexes
+
+    if len(groove_array) % 2 != 0:
+        raise ValueError("The groove array must contain an even number of elements")
+
+    for i in range(0, len(groove_array), 2):
+        start = groove_array[i]
+        end = groove_array[i+1]
+        waveforms[start:end+1] = np.nan
+
+    return waveforms.tolist()
+
+
+def update_waveforms(data: Dict[str, List[int]]) -> Dict[str, List[int]]:
+    # First update the groove array
+    data = update_groove_array(data)
+    
+    # Then scale the waveforms as before
+    data['waveforms'] = [value / 100.0 for value in data['waveforms']]
+    
+    return data
+
+def decimal_to_binary(decimal_list):
+    '''Takes a list of decimal numbers and converts them into binary numbers.'''
+    max_length = len(bin(max(decimal_list))[2:])
+    return [bin(num)[2:].zfill(max_length) for num in decimal_list]
+
+def edge_removal(binary_list):
+    '''Takes a list of binary numbers and removes the leftmost '1' if it exists.'''
+    return [num.replace('1', '0', 1) if num[0] == '1' else num for num in binary_list]
+
+def binary_to_decimal(binary_list):
+    '''Takes a list of binary numbers and converts them into decimal numbers.'''
+    return [int(num, 2) for num in binary_list]
+
+def update_groove_array(data: Dict[str, List[int]]) -> Dict[str, List[int]]:
+    '''Update groove array by converting to binary, removing edge, and converting back to decimal.'''
+    # Convert groove array to binary 
+    binary_array = decimal_to_binary(data.get('groove_array'))
+    
+    # Remove edge from binary representation
+    result = edge_removal(binary_array)
+    
+    # Convert back to decimal
+    data['groove_array'] = binary_to_decimal(result)
+    
+    return data
+
+def process_channels(data: Dict[str, List[int]]) -> Tuple[np.ndarray, np.ndarray]:
+    channel_A = replace_with_nan(data.get('waveforms')[:1800], data.get('groove_array'))
+    channel_B = replace_with_nan(data.get('waveforms')[1800:], data.get('groove_array'))
+
+    return channel_A, channel_B
+
+def create_marker_sizes(channel: np.ndarray) -> List[int]:
+    mask = np.isnan(channel)
+    first_dot_after_nan = np.concatenate(([False], np.diff(mask) == -1))
+    return [20 if x else 1 for x in first_dot_after_nan]
+
+def create_waveform_traces(channel_A: np.ndarray, channel_B: np.ndarray) -> Tuple[go.Scatter, go.Scatter]:
+    trace_A = go.Scatter(y=channel_A, mode='lines+markers', name='Channel A')
+    trace_B = go.Scatter(y=channel_B, mode='lines+markers', name='Channel B')
+    return trace_A, trace_B
+
+def create_orbit_plot_trace(channel_A: np.ndarray, channel_B: np.ndarray) -> go.Scatter:
+    marker_sizes = create_marker_sizes(channel_A)
+    return go.Scatter(x=channel_A, y=channel_B, mode='lines+markers', marker=dict(size=marker_sizes, opacity=0.8))
+
+def set_machine_saver_theme():
+    """Set up the Machine Saver plotly theme."""
+    pio.templates["draft"] = go.layout.Template(
+        layout_annotations=[
+            dict(
+                name="draft watermark",
+                text="Machine Saver Inc.",
+                textangle=-30,
+                opacity=0.1,
+                font=dict(color="white", size=50),
+                xref="paper",
+                yref="paper",
+                x=0.5,
+                y=0.5,
+                showarrow=True,
+            )
+        ],
+        data_scatter=[
+            dict(
+                marker=dict(size=2),  # Increase marker size here
+            )
+        ]
+    )
+    pio.templates.default = "plotly_dark+draft"
+
+def create_combined_plot(data: Dict[str, List[int]]) -> go.Figure:
+    set_machine_saver_theme()
+    channel_A, channel_B = process_channels(data)
+    trace_A, trace_B = create_waveform_traces(channel_A, channel_B)
+    orbit_trace = create_orbit_plot_trace(channel_A, channel_B)
+
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('Waveform', 'Orbit Plot'))
+    fig.add_trace(trace_A, row=1, col=1)
+    fig.add_trace(trace_B, row=1, col=1)
+    fig.update_yaxes(title_text='Values', row=1, col=1)
+    fig.add_trace(orbit_trace, row=1, col=2)
+    fig.update_xaxes(title_text='Channel A', row=1, col=2)
+    fig.update_yaxes(title_text='Channel B', row=1, col=2)
+    fig.update_layout(xaxis2=dict(scaleanchor="y2", scaleratio=1), title='Combined Plot', xaxis_title='Samples')
+
+    return fig
+
+def main():
+    twinprox = TwinProx(port="COM4", slaveaddress=10)
+
+    # while True:
+    data = {}
+
+    # Trigger data capture
+    data['unix_timestamp'] = twinprox.trigger_capture()
+
+    while twinprox.check_capture_engine() != 0:
+        pass
+
+    # data['clip_size'] = twinprox.get_dataclip_size()
+    twinprox.extract_data()
+    # data['header'] = extract_header(data['data_array'])
+    # data['waveforms'] = extract_waveforms(data['data_array'])
+    # data['groove_array'] = extract_groove_array(data['data_array'])
+    # data = update_waveforms(data)
+
+    # Update the plot with new data
+    fig = create_combined_plot(data)
+    # print(f"After creating combined plots: waveforms = {data}")
+    fig.update_traces(y=data['waveforms'][:1800], selector=dict(name='Channel A'))
+    fig.update_traces(y=data['waveforms'][1800:], selector=dict(name='Channel B'))
+    fig.update_traces(x=data['waveforms'][:1800], y=data['waveforms'][1800:], selector=dict(name='Orbit Plot'))
+    fig.show()
+    
+    print(data)
+
+main()
